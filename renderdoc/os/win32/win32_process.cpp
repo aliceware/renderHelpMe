@@ -249,51 +249,905 @@ extern "C" __declspec(dllexport) void __cdecl INTERNAL_ApplyEnvMods(void *ignore
   Process::ApplyEnvironmentModification();
 }
 
-void InjectDLL(HANDLE hProcess, rdcwstr libName)
+uintptr_t FindRemoteDLL(DWORD pid, rdcstr libName);
+
+static void AppendByte(rdcarray<uint8_t> &code, uint8_t value)
 {
-  wchar_t dllPath[MAX_PATH + 1] = {0};
-  wcscpy_s(dllPath, libName.c_str());
+  code.push_back(value);
+}
 
-  static HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
+#if defined(_WIN64)
+static void AppendUInt64(rdcarray<uint8_t> &code, uint64_t value)
+{
+  for(int i = 0; i < 8; i++)
+    code.push_back(uint8_t(value >> (i * 8)));
+}
+#else
+static void AppendUInt32(rdcarray<uint8_t> &code, uint32_t value)
+{
+  for(int i = 0; i < 4; i++)
+    code.push_back(uint8_t(value >> (i * 8)));
+}
+#endif
 
-  if(kernel32 == NULL)
+static bool InjectDLLWithThreadContext(DWORD pid, HANDLE hProcess, rdcwstr libName,
+                                       rdcstr *failureReason)
+{
+  RDCDEBUG("SetThreadContext injection path for %u: %ls", pid, libName.c_str());
+  auto fail = [&](const char *stage) {
+    DWORD error = GetLastError();
+    if(failureReason)
+      *failureReason = StringFormat::Fmt("%s (error %u)", stage, error);
+    RDCERR("SetThreadContext injection failed at %s for process %u: %u", stage, pid, error);
+    return false;
+  };
+
+  HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
+  HMODULE kernelbase = GetModuleHandleA("kernelbase.dll");
+  HMODULE loadLibraryModule = kernelbase ? kernelbase : kernel32;
+  if(kernel32 == NULL || loadLibraryModule == NULL)
   {
     RDCERR("Couldn't get handle for kernel32.dll");
-    return;
+    return fail("resolving LoadLibraryExW");
   }
 
-  void *remoteMem =
-      VirtualAllocEx(hProcess, NULL, sizeof(dllPath), MEM_COMMIT, PAGE_EXECUTE_READWRITE);
-  if(remoteMem)
+  // Use LoadLibraryExW with the DLL-directory and default-directory search flags so the injected
+  // DLL first resolves private dependencies from its own directory, then still finds system
+  // runtime DLLs. This avoids accidentally binding to an older same-named runtime shipped beside
+  // the game while retaining normal API-set resolution.
+  uintptr_t loadLibraryLocal = (uintptr_t)GetProcAddress(loadLibraryModule, "LoadLibraryExW");
+  uintptr_t getLastErrorLocal = (uintptr_t)GetProcAddress(kernel32, "GetLastError");
+  if(loadLibraryLocal == 0)
   {
-    BOOL success = WriteProcessMemory(hProcess, remoteMem, (void *)dllPath, sizeof(dllPath), NULL);
-    if(success)
+    RDCERR("Couldn't resolve LoadLibraryExW in target process %u", pid);
+    return fail("resolving LoadLibraryExW");
+  }
+
+  const char *loadLibraryModuleName = kernelbase ? "kernelbase.dll" : "kernel32.dll";
+  uintptr_t kernel32Remote = FindRemoteDLL(pid, loadLibraryModuleName);
+  uintptr_t kernel32BaseRemote = FindRemoteDLL(pid, "kernel32.dll");
+  uintptr_t loadLibraryRemote = loadLibraryLocal;
+  if(kernel32Remote != 0)
+    loadLibraryRemote = kernel32Remote + loadLibraryLocal - (uintptr_t)loadLibraryModule;
+  uintptr_t getLastErrorRemote = getLastErrorLocal;
+  if(kernel32BaseRemote != 0 && getLastErrorLocal != 0)
+    getLastErrorRemote = kernel32BaseRemote + getLastErrorLocal - (uintptr_t)kernel32;
+  RDCDEBUG("SetThreadContext injection: kernel32 local=%p remote=%p LoadLibraryExW=%p", kernel32,
+           (void *)kernel32Remote, (void *)loadLibraryRemote);
+
+  THREADENTRY32 threadEntry;
+  RDCEraseEl(threadEntry);
+  threadEntry.dwSize = sizeof(threadEntry);
+
+  HANDLE threadSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+  if(threadSnapshot == INVALID_HANDLE_VALUE)
+  {
+    RDCERR("Couldn't enumerate threads for process %u: %u", pid, GetLastError());
+    return fail("enumerating threads");
+  }
+
+  struct ThreadCandidate
+  {
+    DWORD id;
+    HANDLE handle;
+    uint64_t cpuTime;
+  };
+  rdcarray<ThreadCandidate> candidates;
+  if(Thread32First(threadSnapshot, &threadEntry))
+  {
+    do
     {
-      HANDLE hThread = CreateRemoteThread(
-          hProcess, NULL, 1024 * 1024U,
-          (LPTHREAD_START_ROUTINE)GetProcAddress(kernel32, "LoadLibraryW"), remoteMem, 0, NULL);
-      if(hThread)
+      if(threadEntry.th32OwnerProcessID == pid)
       {
-        WaitForSingleObject(hThread, INFINITE);
-        CloseHandle(hThread);
+        HANDLE candidate = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT |
+                                          THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION,
+                                      FALSE, threadEntry.th32ThreadID);
+        if(candidate != NULL)
+        {
+          FILETIME creation, exit, kernel, user;
+          if(GetThreadTimes(candidate, &creation, &exit, &kernel, &user))
+          {
+            ULARGE_INTEGER kernelTime, userTime;
+            kernelTime.LowPart = kernel.dwLowDateTime;
+            kernelTime.HighPart = kernel.dwHighDateTime;
+            userTime.LowPart = user.dwLowDateTime;
+            userTime.HighPart = user.dwHighDateTime;
+            candidates.push_back({threadEntry.th32ThreadID,
+                                  candidate,
+                                  kernelTime.QuadPart + userTime.QuadPart});
+            continue;
+          }
+          CloseHandle(candidate);
+        }
+      }
+    } while(Thread32Next(threadSnapshot, &threadEntry));
+  }
+  CloseHandle(threadSnapshot);
+
+  Sleep(20);
+
+  HANDLE thread = NULL;
+  uint64_t bestCpuDelta = 0;
+  size_t bestCandidate = ~size_t(0);
+  for(size_t i = 0; i < candidates.size(); i++)
+  {
+    FILETIME creation, exit, kernel, user;
+    uint64_t after = candidates[i].cpuTime;
+    if(GetThreadTimes(candidates[i].handle, &creation, &exit, &kernel, &user))
+    {
+      ULARGE_INTEGER kernelTime, userTime;
+      kernelTime.LowPart = kernel.dwLowDateTime;
+      kernelTime.HighPart = kernel.dwHighDateTime;
+      userTime.LowPart = user.dwLowDateTime;
+      userTime.HighPart = user.dwHighDateTime;
+      after = kernelTime.QuadPart + userTime.QuadPart;
+    }
+
+    uint64_t delta = after >= candidates[i].cpuTime ? after - candidates[i].cpuTime : 0;
+    if(bestCandidate == ~size_t(0) || delta > bestCpuDelta)
+    {
+      bestCandidate = i;
+      bestCpuDelta = delta;
+    }
+  }
+
+  if(bestCandidate != ~size_t(0))
+  {
+    thread = candidates[bestCandidate].handle;
+    threadEntry.th32ThreadID = candidates[bestCandidate].id;
+  }
+
+  for(size_t i = 0; i < candidates.size(); i++)
+  {
+    if(i != bestCandidate)
+      CloseHandle(candidates[i].handle);
+  }
+
+  if(thread == NULL)
+  {
+    RDCERR("Couldn't open a thread in process %u for context injection: %u", pid,
+           GetLastError());
+    return fail("opening a target thread");
+  }
+
+  DWORD originalSuspendCount = SuspendThread(thread);
+  if(originalSuspendCount == DWORD(-1))
+  {
+    RDCERR("Couldn't suspend thread %u for context injection: %u", threadEntry.th32ThreadID,
+           GetLastError());
+    CloseHandle(thread);
+    return fail("suspending target thread");
+  }
+
+  // SuspendThread returns the count before our suspend.  A target can already be suspended by
+  // a debugger, launcher, or another tool, so drain the count while running the trampoline and
+  // restore the exact original count afterwards.
+  DWORD currentSuspendCount = originalSuspendCount + 1;
+  auto adjustSuspendCount = [&](DWORD targetCount) {
+    for(uint32_t attempt = 0; currentSuspendCount != targetCount && attempt < 64; attempt++)
+    {
+      if(currentSuspendCount < targetCount)
+      {
+        DWORD previous = SuspendThread(thread);
+        if(previous == DWORD(-1))
+          return false;
+        currentSuspendCount = previous + 1;
       }
       else
       {
-        RDCERR("Couldn't create remote thread for LoadLibraryW: %u", GetLastError());
+        DWORD previous = ResumeThread(thread);
+        if(previous == DWORD(-1))
+          return false;
+        currentSuspendCount = previous > 0 ? previous - 1 : 0;
       }
+    }
+
+    return currentSuspendCount == targetCount;
+  };
+
+  CONTEXT savedContext;
+  RDCEraseEl(savedContext);
+#if !defined(_WIN64)
+  const bool useWow64Context = false;
+  WOW64_CONTEXT savedWow64Context;
+  RDCEraseEl(savedWow64Context);
+  savedContext.ContextFlags = CONTEXT_ALL;
+  savedWow64Context.ContextFlags = WOW64_CONTEXT_ALL;
+  BOOL gotContext = useWow64Context ? Wow64GetThreadContext(thread, &savedWow64Context)
+                                    : GetThreadContext(thread, &savedContext);
+#else
+  savedContext.ContextFlags = CONTEXT_ALL;
+  BOOL gotContext = GetThreadContext(thread, &savedContext);
+#endif
+  if(!gotContext)
+  {
+    RDCERR("Couldn't read thread context for process %u: %u", pid, GetLastError());
+    adjustSuspendCount(originalSuspendCount);
+    CloseHandle(thread);
+    return fail("reading target thread context");
+  }
+
+  // LaunchAndInjectIntoProcess creates the target suspended.  In that case the initial thread
+  // can still be inside the process loader's startup path.  Calling LoadLibraryExW by hijacking
+  // that context re-enters the loader too early and can make the DLL report
+  // ERROR_DLL_INIT_FAILED.  Let the initial thread reach user code, then suspend it again and
+  // capture a fresh context for the SetThreadContext trampoline.
+  if(originalSuspendCount > 0)
+  {
+    FILETIME creation, exit, kernel, user;
+    uint64_t initialCpuTime = 0;
+    if(GetThreadTimes(thread, &creation, &exit, &kernel, &user))
+    {
+      ULARGE_INTEGER kernelTime, userTime;
+      kernelTime.LowPart = kernel.dwLowDateTime;
+      kernelTime.HighPart = kernel.dwHighDateTime;
+      userTime.LowPart = user.dwLowDateTime;
+      userTime.HighPart = user.dwHighDateTime;
+      initialCpuTime = kernelTime.QuadPart + userTime.QuadPart;
+    }
+
+    if(!adjustSuspendCount(0))
+    {
+      CloseHandle(thread);
+      return fail("resuming target during loader startup");
+    }
+
+    // Wait until the initial thread has executed, with a short settling period for the loader
+    // and CRT startup.  The process is still very early here, so this does not allow normal
+    // rendering to get meaningfully ahead of the capture setup.
+    for(uint32_t retry = 0; retry < 50; retry++)
+    {
+      Sleep(10);
+
+      FILETIME currentCreation, currentExit, currentKernel, currentUser;
+      if(GetThreadTimes(thread, &currentCreation, &currentExit, &currentKernel, &currentUser))
+      {
+        ULARGE_INTEGER currentKernelTime, currentUserTime;
+        currentKernelTime.LowPart = currentKernel.dwLowDateTime;
+        currentKernelTime.HighPart = currentKernel.dwHighDateTime;
+        currentUserTime.LowPart = currentUser.dwLowDateTime;
+        currentUserTime.HighPart = currentUser.dwHighDateTime;
+        uint64_t currentCpuTime = currentKernelTime.QuadPart + currentUserTime.QuadPart;
+        if(currentCpuTime > initialCpuTime && retry >= 10)
+          break;
+      }
+    }
+
+    // The initial thread may now be blocked in a startup wait.  A suspended thread in a kernel
+    // wait will not execute a newly assigned RIP until that wait completes, so refresh the thread
+    // list and prefer a thread that is actively consuming CPU after startup.
+    rdcarray<ThreadCandidate> freshCandidates;
+    HANDLE freshSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if(freshSnapshot != INVALID_HANDLE_VALUE)
+    {
+      THREADENTRY32 freshEntry;
+      RDCEraseEl(freshEntry);
+      freshEntry.dwSize = sizeof(freshEntry);
+      if(Thread32First(freshSnapshot, &freshEntry))
+      {
+        do
+        {
+          if(freshEntry.th32OwnerProcessID == pid)
+          {
+            HANDLE candidate = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT |
+                                              THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION,
+                                          FALSE, freshEntry.th32ThreadID);
+            if(candidate != NULL)
+            {
+              FILETIME candidateCreation, candidateExit, candidateKernel, candidateUser;
+              if(GetThreadTimes(candidate, &candidateCreation, &candidateExit, &candidateKernel,
+                                &candidateUser))
+              {
+                ULARGE_INTEGER candidateKernelTime, candidateUserTime;
+                candidateKernelTime.LowPart = candidateKernel.dwLowDateTime;
+                candidateKernelTime.HighPart = candidateKernel.dwHighDateTime;
+                candidateUserTime.LowPart = candidateUser.dwLowDateTime;
+                candidateUserTime.HighPart = candidateUser.dwHighDateTime;
+                freshCandidates.push_back({freshEntry.th32ThreadID,
+                                           candidate,
+                                           candidateKernelTime.QuadPart + candidateUserTime.QuadPart});
+                continue;
+              }
+              CloseHandle(candidate);
+            }
+          }
+        } while(Thread32Next(freshSnapshot, &freshEntry));
+      }
+      CloseHandle(freshSnapshot);
+    }
+
+    Sleep(20);
+
+    size_t freshBest = ~size_t(0);
+    uint64_t freshBestDelta = 0;
+    for(size_t i = 0; i < freshCandidates.size(); i++)
+    {
+      FILETIME candidateCreation, candidateExit, candidateKernel, candidateUser;
+      uint64_t after = freshCandidates[i].cpuTime;
+      if(GetThreadTimes(freshCandidates[i].handle, &candidateCreation, &candidateExit,
+                        &candidateKernel, &candidateUser))
+      {
+        ULARGE_INTEGER candidateKernelTime, candidateUserTime;
+        candidateKernelTime.LowPart = candidateKernel.dwLowDateTime;
+        candidateKernelTime.HighPart = candidateKernel.dwHighDateTime;
+        candidateUserTime.LowPart = candidateUser.dwLowDateTime;
+        candidateUserTime.HighPart = candidateUser.dwHighDateTime;
+        after = candidateKernelTime.QuadPart + candidateUserTime.QuadPart;
+      }
+
+      uint64_t delta = after >= freshCandidates[i].cpuTime ? after - freshCandidates[i].cpuTime : 0;
+      if(freshBest == ~size_t(0) || delta > freshBestDelta)
+      {
+        freshBest = i;
+        freshBestDelta = delta;
+      }
+    }
+
+    if(freshBest != ~size_t(0))
+    {
+      HANDLE freshThread = freshCandidates[freshBest].handle;
+      DWORD freshThreadId = freshCandidates[freshBest].id;
+      for(size_t i = 0; i < freshCandidates.size(); i++)
+      {
+        if(i != freshBest)
+          CloseHandle(freshCandidates[i].handle);
+      }
+
+      CloseHandle(thread);
+      thread = freshThread;
+      threadEntry.th32ThreadID = freshThreadId;
+      originalSuspendCount = 0;
     }
     else
     {
-      RDCERR("Couldn't write remote memory %p with dllPath '%ls': %u", remoteMem, dllPath,
-             GetLastError());
+      for(ThreadCandidate &candidate : freshCandidates)
+        CloseHandle(candidate.handle);
     }
 
-    VirtualFreeEx(hProcess, remoteMem, 0, MEM_RELEASE);
+    DWORD suspendBeforeRefresh = SuspendThread(thread);
+    if(suspendBeforeRefresh == DWORD(-1))
+    {
+      CloseHandle(thread);
+      return fail("suspending target after loader startup");
+    }
+    currentSuspendCount = suspendBeforeRefresh + 1;
+
+    RDCEraseEl(savedContext);
+#if !defined(_WIN64)
+    RDCEraseEl(savedWow64Context);
+    savedContext.ContextFlags = CONTEXT_ALL;
+    savedWow64Context.ContextFlags = WOW64_CONTEXT_ALL;
+    gotContext = useWow64Context ? Wow64GetThreadContext(thread, &savedWow64Context)
+                                : GetThreadContext(thread, &savedContext);
+#else
+    savedContext.ContextFlags = CONTEXT_ALL;
+    gotContext = GetThreadContext(thread, &savedContext);
+#endif
+    if(!gotContext)
+    {
+      adjustSuspendCount(originalSuspendCount);
+      CloseHandle(thread);
+      return fail("reading target context after loader startup");
+    }
+  }
+
+#if defined(_WIN64)
+  uintptr_t savedStackPointer = (uintptr_t)savedContext.Rsp;
+#elif defined(_WIN32)
+  uintptr_t savedStackPointer =
+      (uintptr_t)(useWow64Context ? savedWow64Context.Esp : savedContext.Esp);
+#else
+  uintptr_t savedStackPointer = (uintptr_t)savedContext.Esp;
+#endif
+  MEMORY_BASIC_INFORMATION stackInfo;
+  RDCEraseEl(stackInfo);
+  void *stackBackupAddress = NULL;
+  SIZE_T stackBackupSize = 0;
+  rdcarray<uint8_t> stackBackup;
+  if(VirtualQueryEx(hProcess, (void *)savedStackPointer, &stackInfo, sizeof(stackInfo)) ==
+         sizeof(stackInfo) &&
+     stackInfo.State == MEM_COMMIT && stackInfo.RegionSize > 0)
+  {
+    stackBackupAddress = stackInfo.BaseAddress;
+    stackBackupSize = stackInfo.RegionSize;
+    stackBackup.resize(stackBackupSize);
+
+    SIZE_T stackBytesRead = 0;
+    if(!ReadProcessMemory(hProcess, stackBackupAddress, stackBackup.data(), stackBackupSize,
+                          &stackBytesRead) ||
+       stackBytesRead != stackBackupSize)
+    {
+      stackBackupAddress = NULL;
+      stackBackupSize = 0;
+      stackBackup.clear();
+    }
+  }
+
+  if(stackBackupAddress == NULL)
+  {
+    ResumeThread(thread);
+    CloseHandle(thread);
+    return fail("backing up target thread stack");
+  }
+
+  const SIZE_T pathSize = (wcslen(libName.c_str()) + 1) * sizeof(wchar_t);
+  void *remotePath = VirtualAllocEx(hProcess, NULL, pathSize, MEM_COMMIT | MEM_RESERVE,
+                                    PAGE_READWRITE);
+  void *remoteFlag = VirtualAllocEx(hProcess, NULL, sizeof(uint32_t), MEM_COMMIT | MEM_RESERVE,
+                                    PAGE_READWRITE);
+  void *remoteError = VirtualAllocEx(hProcess, NULL, sizeof(uint32_t), MEM_COMMIT | MEM_RESERVE,
+                                     PAGE_READWRITE);
+
+  rdcarray<uint8_t> code;
+  code.reserve(256);
+
+#if defined(_WIN64)
+  // Save all GPRs and flags, call LoadLibraryExW using the existing thread stack, then set a
+  // completion flag and spin. The host restores the complete original CONTEXT before resuming.
+  AppendByte(code, 0x50); // push rax
+  AppendByte(code, 0x48);
+  AppendByte(code, 0xb8); // mov rax, remoteFlag
+  size_t entryFlagImmediate = code.size();
+  AppendUInt64(code, 0);
+  AppendByte(code, 0xc6);
+  AppendByte(code, 0x00);
+  AppendByte(code, 0x01); // mov byte ptr [rax], 1
+  AppendByte(code, 0x9c); // pushfq
+  AppendByte(code, 0x53); // push rbx
+  AppendByte(code, 0x51); // push rcx
+  AppendByte(code, 0x52); // push rdx
+  AppendByte(code, 0x55); // push rbp
+  AppendByte(code, 0x56); // push rsi
+  AppendByte(code, 0x57); // push rdi
+  for(uint8_t reg = 0x50; reg <= 0x57; reg++)
+  {
+    AppendByte(code, 0x41);
+    AppendByte(code, reg); // push r8..r15
+  }
+  AppendByte(code, 0x48);
+  AppendByte(code, 0x83);
+  AppendByte(code, 0xec);
+  AppendByte(code, 0x28); // shadow space and alignment
+  AppendByte(code, 0x48);
+  AppendByte(code, 0xb9); // mov rcx, remotePath
+  size_t pathImmediate = code.size();
+  AppendUInt64(code, 0);
+  AppendByte(code, 0x48);
+  AppendByte(code, 0xb8); // mov rax, LoadLibraryExW
+  AppendUInt64(code, loadLibraryRemote);
+  AppendByte(code, 0xff);
+  AppendByte(code, 0xd0); // call rax
+  AppendByte(code, 0x48);
+  AppendByte(code, 0xb8); // mov rax, remoteFlag
+  size_t callFlagImmediate = code.size();
+  AppendUInt64(code, 0);
+  AppendByte(code, 0xc6);
+  AppendByte(code, 0x00);
+  AppendByte(code, 0x02); // mov byte ptr [rax], 2
+  AppendByte(code, 0x48);
+  AppendByte(code, 0x83);
+  AppendByte(code, 0xc4);
+  AppendByte(code, 0x28);
+  for(uint8_t reg = 0x5f; reg >= 0x58; reg--)
+  {
+    AppendByte(code, 0x41);
+    AppendByte(code, reg); // pop r15..r8
+  }
+  AppendByte(code, 0x5f); // pop rdi
+  AppendByte(code, 0x5e); // pop rsi
+  AppendByte(code, 0x5d); // pop rbp
+  AppendByte(code, 0x5a); // pop rdx
+  AppendByte(code, 0x59); // pop rcx
+  AppendByte(code, 0x5b); // pop rbx
+  AppendByte(code, 0x9d); // popfq
+  AppendByte(code, 0x58); // pop rax
+  AppendByte(code, 0x48);
+  AppendByte(code, 0xb8); // mov rax, remoteFlag
+  size_t flagImmediate = code.size();
+  AppendUInt64(code, 0);
+  AppendByte(code, 0xc6);
+  AppendByte(code, 0x00);
+  AppendByte(code, 0x01); // mov byte ptr [rax], 1
+#else
+  // The x86 Windows ABI uses stdcall for LoadLibraryExW, so the callee removes its three
+  // arguments.
+  // The host restores the complete original CONTEXT after the trampoline reports its result.
+  size_t entryFlagImmediate = code.size();
+  AppendByte(code, 0xba); // mov edx, remoteFlag
+  AppendUInt32(code, 0);
+  AppendByte(code, 0xc6);
+  AppendByte(code, 0x02);
+  AppendByte(code, 0x03); // mov byte ptr [edx], 3 (trampoline entered)
+  size_t getLastErrorImmediate = 0;
+  size_t failureErrorImmediate = 0;
+  AppendByte(code, 0x83);
+  AppendByte(code, 0xec);
+  AppendByte(code, 0x10); // reserve stack space below the original ESP
+  AppendByte(code, 0x68); // push LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS
+  AppendByte(code, 0x00);
+  AppendByte(code, 0x11);
+  AppendByte(code, 0x00);
+  AppendByte(code, 0x00);
+  AppendByte(code, 0x6a); // push hFile = NULL
+  AppendByte(code, 0x00);
+  AppendByte(code, 0x68); // push remotePath
+  size_t pathImmediate = code.size();
+  AppendUInt32(code, 0);
+  AppendByte(code, 0xb8); // mov eax, LoadLibraryExW
+  size_t loadLibraryImmediate = code.size();
+  AppendUInt32(code, 0);
+  AppendByte(code, 0xff);
+  AppendByte(code, 0xd0); // call eax
+  AppendByte(code, 0x83);
+  AppendByte(code, 0xc4);
+  AppendByte(code, 0x10); // release the reserved stack space
+  AppendByte(code, 0x85);
+  AppendByte(code, 0xc0); // test eax, eax
+  AppendByte(code, 0x74);
+  AppendByte(code, 0x0a); // jump over the success marker when LoadLibraryExW failed
+  AppendByte(code, 0xba); // mov edx, remoteFlag
+  size_t successFlagImmediate = code.size();
+  AppendUInt32(code, 0);
+  AppendByte(code, 0xc6);
+  AppendByte(code, 0x02);
+  AppendByte(code, 0x01); // mov byte ptr [edx], 1
+  AppendByte(code, 0xeb);
+  AppendByte(code, 0x16); // skip the failure error capture and marker
+  AppendByte(code, 0xb8); // mov eax, GetLastError
+  getLastErrorImmediate = code.size();
+  AppendUInt32(code, 0);
+  AppendByte(code, 0xff);
+  AppendByte(code, 0xd0); // call eax
+  AppendByte(code, 0xba); // mov edx, remoteError
+  failureErrorImmediate = code.size();
+  AppendUInt32(code, 0);
+  AppendByte(code, 0x89);
+  AppendByte(code, 0x02); // mov [edx], eax
+  AppendByte(code, 0xba); // mov edx, remoteFlag
+  size_t failureFlagImmediate = code.size();
+  AppendUInt32(code, 0);
+  AppendByte(code, 0xc6);
+  AppendByte(code, 0x02);
+  AppendByte(code, 0x02); // mov byte ptr [edx], 2
+#endif
+
+  AppendByte(code, 0xeb);
+  AppendByte(code, 0xfe); // spin until the host restores the original context
+
+#if defined(_WIN64)
+  // Run a tiny call stub on the target thread's existing stack. The host restores the complete
+  // original CONTEXT after the stub reports the LoadLibraryExW result.
+  bool directLoadLibrary = true;
+  size_t directPathImmediate = 0;
+  size_t directEntryFlagImmediate = 0;
+  size_t directFlagImmediate = 0;
+  size_t directSuccessFlagImmediate = 0;
+  size_t directGetLastErrorImmediate = 0;
+  size_t directErrorImmediate = 0;
+  if(directLoadLibrary)
+  {
+    code.clear();
+    AppendByte(code, 0x48);
+    AppendByte(code, 0x83);
+    AppendByte(code, 0xe4);
+    AppendByte(code, 0xf0); // and rsp, -16 (keep the ABI stack alignment)
+    AppendByte(code, 0x48);
+    AppendByte(code, 0xb8); // mov rax, remoteFlag
+    directEntryFlagImmediate = code.size();
+    AppendUInt64(code, 0);
+    AppendByte(code, 0xc6);
+    AppendByte(code, 0x00);
+    AppendByte(code, 0x03); // mov byte ptr [rax], 3 (trampoline entered)
+    AppendByte(code, 0x48);
+    AppendByte(code, 0x83);
+    AppendByte(code, 0xec);
+    AppendByte(code, 0x20); // reserve the x64 shadow space on the target thread's stack
+    AppendByte(code, 0x48);
+    AppendByte(code, 0xb9); // mov rcx, remotePath
+    directPathImmediate = code.size();
+    AppendUInt64(code, 0);
+    AppendByte(code, 0xba); // mov edx, NULL hFile
+    AppendByte(code, 0x00);
+    AppendByte(code, 0x00);
+    AppendByte(code, 0x00);
+    AppendByte(code, 0x00);
+    AppendByte(code, 0x41);
+    AppendByte(code, 0xb8); // mov r8d, DLL directory + default search flags
+    AppendByte(code, 0x00);
+    AppendByte(code, 0x11);
+    AppendByte(code, 0x00);
+    AppendByte(code, 0x00);
+    AppendByte(code, 0x48);
+    AppendByte(code, 0xb8); // mov rax, LoadLibraryExW
+    AppendUInt64(code, loadLibraryRemote);
+    AppendByte(code, 0xff);
+    AppendByte(code, 0xd0); // call rax
+    AppendByte(code, 0x48);
+    AppendByte(code, 0x85);
+    AppendByte(code, 0xc0); // test rax, rax (LoadLibraryExW result)
+    AppendByte(code, 0x74);
+    AppendByte(code, 0x0f); // jump over the success marker when LoadLibraryExW failed
+    AppendByte(code, 0x48);
+    AppendByte(code, 0xb8); // mov rax, remoteFlag
+    directFlagImmediate = code.size();
+    AppendUInt64(code, 0);
+    AppendByte(code, 0xc6);
+    AppendByte(code, 0x00);
+    AppendByte(code, 0x01); // mov byte ptr [rax], 1 (LoadLibraryExW succeeded)
+    AppendByte(code, 0xeb);
+    AppendByte(code, 0x25); // skip the failure marker and remote error capture
+    AppendByte(code, 0x48);
+    AppendByte(code, 0xb8); // mov rax, GetLastError
+    directGetLastErrorImmediate = code.size();
+    AppendUInt64(code, 0);
+    AppendByte(code, 0xff);
+    AppendByte(code, 0xd0); // call rax
+    AppendByte(code, 0x48);
+    AppendByte(code, 0xb9); // mov rcx, remoteError
+    directErrorImmediate = code.size();
+    AppendUInt64(code, 0);
+    AppendByte(code, 0x89);
+    AppendByte(code, 0x01); // mov [rcx], eax
+    AppendByte(code, 0x48);
+    AppendByte(code, 0xb8); // mov rax, remoteFlag
+    directSuccessFlagImmediate = code.size();
+    AppendUInt64(code, 0);
+    AppendByte(code, 0xc6);
+    AppendByte(code, 0x00);
+    AppendByte(code, 0x02); // mov byte ptr [rax], 2 (LoadLibraryExW failed)
+    AppendByte(code, 0xeb);
+    AppendByte(code, 0xfe); // spin until the host restores the original context
+
+  }
+#endif
+
+  void *remoteCode = VirtualAllocEx(hProcess, NULL, code.size(), MEM_COMMIT | MEM_RESERVE,
+                                    PAGE_EXECUTE_READWRITE);
+  bool success = remotePath != NULL && remoteFlag != NULL && remoteError != NULL && remoteCode != NULL;
+  const char *failureStage = NULL;
+  if(!success)
+    failureStage = "allocating remote injection memory";
+
+  SIZE_T written = 0;
+  if(success)
+  {
+    success = WriteProcessMemory(hProcess, remotePath, libName.c_str(), pathSize, &written) &&
+              written == pathSize;
+    if(!success)
+      failureStage = "writing DLL path";
+  }
+
+  if(success)
+  {
+#if defined(_WIN64)
+    uint64_t flagAddress = (uint64_t)(uintptr_t)remoteFlag;
+    if(directLoadLibrary)
+    {
+      uint64_t pathAddress = (uint64_t)(uintptr_t)remotePath;
+      uint64_t errorFunctionAddress = (uint64_t)getLastErrorRemote;
+      uint64_t errorAddress = (uint64_t)(uintptr_t)remoteError;
+      memcpy(&code[directPathImmediate], &pathAddress, sizeof(pathAddress));
+      memcpy(&code[directEntryFlagImmediate], &flagAddress, sizeof(flagAddress));
+      memcpy(&code[directFlagImmediate], &flagAddress, sizeof(flagAddress));
+      memcpy(&code[directGetLastErrorImmediate], &errorFunctionAddress,
+             sizeof(errorFunctionAddress));
+      memcpy(&code[directErrorImmediate], &errorAddress, sizeof(errorAddress));
+      memcpy(&code[directSuccessFlagImmediate], &flagAddress, sizeof(flagAddress));
+    }
+    else
+    {
+      uint64_t pathAddress = (uint64_t)(uintptr_t)remotePath;
+      memcpy(&code[pathImmediate], &pathAddress, sizeof(pathAddress));
+      memcpy(&code[flagImmediate], &flagAddress, sizeof(flagAddress));
+      memcpy(&code[entryFlagImmediate], &flagAddress, sizeof(flagAddress));
+      memcpy(&code[callFlagImmediate], &flagAddress, sizeof(flagAddress));
+    }
+#else
+    uint32_t pathAddress = (uint32_t)(uintptr_t)remotePath;
+    uint32_t flagAddress = (uint32_t)(uintptr_t)remoteFlag;
+    uint32_t errorAddress = (uint32_t)(uintptr_t)remoteError;
+    uint32_t loadLibraryAddress = (uint32_t)loadLibraryRemote;
+    uint32_t getLastErrorAddress = (uint32_t)getLastErrorRemote;
+    memcpy(&code[entryFlagImmediate], &flagAddress, sizeof(flagAddress));
+    memcpy(&code[pathImmediate], &pathAddress, sizeof(pathAddress));
+    memcpy(&code[loadLibraryImmediate], &loadLibraryAddress, sizeof(loadLibraryAddress));
+    memcpy(&code[successFlagImmediate], &flagAddress, sizeof(flagAddress));
+    memcpy(&code[failureFlagImmediate], &flagAddress, sizeof(flagAddress));
+    memcpy(&code[getLastErrorImmediate], &getLastErrorAddress, sizeof(getLastErrorAddress));
+    memcpy(&code[failureErrorImmediate], &errorAddress, sizeof(errorAddress));
+#endif
+    uint32_t zero = 0;
+    success = WriteProcessMemory(hProcess, remoteFlag, &zero, sizeof(zero), &written) &&
+              written == sizeof(uint32_t) &&
+              WriteProcessMemory(hProcess, remoteError, &zero, sizeof(zero), &written) &&
+              written == sizeof(uint32_t) &&
+              WriteProcessMemory(hProcess, remoteCode, code.data(), code.size(), &written) &&
+              written == code.size() && FlushInstructionCache(hProcess, remoteCode, code.size());
+    if(!success)
+      failureStage = "writing trampoline";
+  }
+
+  CONTEXT injectedContext = savedContext;
+#if defined(_WIN64)
+  injectedContext.Rip = (DWORD64)(uintptr_t)remoteCode;
+  injectedContext.Rsp = savedContext.Rsp;
+#else
+  WOW64_CONTEXT injectedWow64Context = savedWow64Context;
+  if(useWow64Context)
+  {
+    injectedWow64Context.Eip = (DWORD)(uintptr_t)remoteCode;
+    injectedWow64Context.Esp = savedWow64Context.Esp;
   }
   else
   {
-    RDCERR("Couldn't allocate remote memory for DLL '%ls': %u", libName.c_str(), GetLastError());
+    injectedContext.Eip = (DWORD)(uintptr_t)remoteCode;
+    injectedContext.Esp = savedContext.Esp;
   }
+#endif
+
+  if(success)
+  {
+#if defined(_WIN64)
+    success = SetThreadContext(thread, &injectedContext) != FALSE;
+#else
+    success = useWow64Context ? Wow64SetThreadContext(thread, &injectedWow64Context)
+                              : SetThreadContext(thread, &injectedContext);
+#endif
+    if(!success)
+      failureStage = "setting target thread context";
+    else
+    {
+      CONTEXT verifyContext;
+      RDCEraseEl(verifyContext);
+#if !defined(_WIN64)
+      WOW64_CONTEXT verifyWow64Context;
+      RDCEraseEl(verifyWow64Context);
+      verifyContext.ContextFlags = CONTEXT_CONTROL;
+      verifyWow64Context.ContextFlags = WOW64_CONTEXT_CONTROL;
+      BOOL verified = useWow64Context ? Wow64GetThreadContext(thread, &verifyWow64Context)
+                                      : GetThreadContext(thread, &verifyContext);
+#else
+      verifyContext.ContextFlags = CONTEXT_CONTROL;
+      BOOL verified = GetThreadContext(thread, &verifyContext);
+#endif
+      if(!verified)
+      {
+        success = false;
+        failureStage = "verifying target thread context";
+      }
+#if defined(_WIN64)
+      else if(verifyContext.Rip != injectedContext.Rip)
+#elif defined(_WIN32)
+      else if(useWow64Context ? (verifyWow64Context.Eip != injectedWow64Context.Eip)
+                              : (verifyContext.Eip != injectedContext.Eip))
+#else
+      else if(verifyContext.Eip != injectedContext.Eip)
+#endif
+      {
+        success = false;
+        failureStage = "target thread context was not updated";
+      }
+    }
+  }
+
+  if(success)
+  {
+    if(!adjustSuspendCount(0))
+    {
+      success = false;
+      failureStage = "resuming target thread";
+    }
+  }
+
+  bool completed = false;
+  uint32_t observedFlag = 0;
+  uint32_t observedError = 0;
+  DWORD observedProcessExit = STILL_ACTIVE;
+  for(uint32_t retry = 0; success && retry < 3000; retry++)
+  {
+    uint32_t flag = 0;
+    SIZE_T read = 0;
+    if(ReadProcessMemory(hProcess, remoteFlag, &flag, sizeof(flag), &read) && read == sizeof(flag) &&
+       (flag == 1 || flag == 2))
+    {
+      observedFlag = flag;
+      if(observedFlag == 2)
+      {
+        SIZE_T errorRead = 0;
+        ReadProcessMemory(hProcess, remoteError, &observedError, sizeof(observedError), &errorRead);
+      }
+      completed = true;
+      break;
+    }
+
+    if(ReadProcessMemory(hProcess, remoteFlag, &flag, sizeof(flag), &read) && flag == 3)
+      observedFlag = 3;
+
+    if(GetExitCodeProcess(hProcess, &observedProcessExit) &&
+       observedProcessExit != STILL_ACTIVE)
+    {
+      failureStage = "target process exited before LoadLibraryExW trampoline completed";
+      break;
+    }
+    Sleep(10);
+  }
+  bool restored = true;
+  if(currentSuspendCount == 0)
+  {
+    restored = adjustSuspendCount(1);
+  }
+
+  if(restored)
+  {
+    SIZE_T stackBytesWritten = 0;
+    restored = WriteProcessMemory(hProcess, stackBackupAddress, stackBackup.data(),
+                                  stackBackupSize, &stackBytesWritten) &&
+               stackBytesWritten == stackBackupSize;
+  }
+
+  if(restored)
+  {
+#if defined(_WIN64)
+    restored = SetThreadContext(thread, &savedContext) != FALSE;
+#else
+    restored = useWow64Context ? Wow64SetThreadContext(thread, &savedWow64Context)
+                              : SetThreadContext(thread, &savedContext);
+#endif
+    if(restored)
+      restored = adjustSuspendCount(originalSuspendCount);
+  }
+
+  if(success && !completed)
+  {
+    SIZE_T read = 0;
+    ReadProcessMemory(hProcess, remoteFlag, &observedFlag, sizeof(observedFlag), &read);
+    if(observedFlag == 3)
+      failureStage = "LoadLibraryExW trampoline entered but did not return";
+    else if(observedProcessExit != STILL_ACTIVE)
+      failureStage = "target process exited before LoadLibraryExW trampoline completed";
+    else
+      failureStage = "waiting for LoadLibraryExW trampoline";
+  }
+  else if(completed && observedFlag == 2)
+  {
+    failureStage = "LoadLibraryExW returned NULL";
+  }
+  if(!restored)
+    failureStage = "restoring target thread context";
+  success = success && completed && restored;
+  if(success && observedFlag == 2)
+  {
+    success = false;
+    failureStage = "LoadLibraryExW returned NULL";
+  }
+  if(success && observedFlag == 1)
+  {
+    rdcstr loadedName = get_basename(StringFormat::Wide2UTF8(libName));
+    if(FindRemoteDLL(pid, loadedName) == 0)
+    {
+      success = false;
+      failureStage = "LoadLibraryExW reported success but the module was not found";
+    }
+  }
+
+  if(!success && failureReason)
+  {
+    DWORD error = observedFlag == 2 ? observedError : GetLastError();
+    *failureReason = StringFormat::Fmt("%s for '%s' (status %u, error %u)",
+                                       failureStage ? failureStage : "unknown",
+                                       StringFormat::Wide2UTF8(libName).c_str(), observedFlag, error);
+  }
+
+  if(remoteCode)
+    VirtualFreeEx(hProcess, remoteCode, 0, MEM_RELEASE);
+  if(remoteFlag)
+    VirtualFreeEx(hProcess, remoteFlag, 0, MEM_RELEASE);
+  if(remoteError)
+    VirtualFreeEx(hProcess, remoteError, 0, MEM_RELEASE);
+  if(remotePath)
+    VirtualFreeEx(hProcess, remotePath, 0, MEM_RELEASE);
+  CloseHandle(thread);
+  return success && completed;
 }
 
 uintptr_t FindRemoteDLL(DWORD pid, rdcstr libName)
@@ -566,6 +1420,9 @@ static PROCESS_INFORMATION RunProcess(const rdcstr &app, const rdcstr &workingDi
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
     RDCEraseEl(pi);
+    // Preserve the CreateProcessW failure for the caller.  The cleanup above can overwrite the
+    // thread-local last-error value, which previously reduced the UI message to a generic failure.
+    SetLastError(err);
   }
 
   return pi;
@@ -669,7 +1526,7 @@ rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
   // We don't support capturing 64-bit programs from a 32-bit install
   // because it's pointless - a 64-bit install will work for all in
   // that case. But we do want to handle the case of:
-  // 64-bit renderdoc -> 32-bit program (via 32-bit renderdoccmd)
+  // 64-bit renderdoc -> 32-bit program (via 32-bit helpmecmd)
   //    -> 64-bit program (going back to 64-bit renderdoccmd).
   // so we try to see if we're an x86 invoked renderdoccmd in an
   // otherwise 64-bit install, and 'promote' back to 64-bit.
@@ -711,13 +1568,13 @@ rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
       CloseHandle(hProcess);
       RDResult result;
       SET_ERROR_RESULT(result, ResultCode::IncompatibleProcess,
-                       "Can't capture 64-bit program with 32-bit build of RenderDoc. Please run a "
-                       "64-bit build of RenderDoc");
+                       "Can't capture 64-bit program with 32-bit build of HelpMe. Please run a "
+                       "64-bit build of HelpMe");
       return {result, 0};
     }
   }
 #else
-  // farm off to alternate bitness renderdoccmd.exe
+  // farm off to alternate bitness helpmecmd.exe
 
   // if the target process is 'wow64' that means it's 32-bit.
   capalt = (isWow64 == TRUE);
@@ -735,7 +1592,7 @@ rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
 
       renderdocPath[idx] = 0;
 
-      wcscat_s(renderdocPath, L"\\Win32\\Development\\renderdoccmd.exe");
+      wcscat_s(renderdocPath, L"\\Win32\\Development\\helpmecmd.exe");
     }
 
     if(!devLocation)
@@ -748,7 +1605,7 @@ rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
 
         renderdocPath[idx] = 0;
 
-        wcscat_s(renderdocPath, L"\\Win32\\Release\\renderdoccmd.exe");
+        wcscat_s(renderdocPath, L"\\Win32\\Release\\helpmecmd.exe");
       }
     }
 
@@ -763,7 +1620,7 @@ rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
         *slash = 0;
 
       // append path
-      wcscat_s(renderdocPath, L"\\x86\\renderdoccmd.exe");
+      wcscat_s(renderdocPath, L"\\x86\\helpmecmd.exe");
     }
 #else
     // if it looks like we're in the development environment, look for the alternate bitness in the
@@ -775,7 +1632,7 @@ rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
 
       renderdocPath[idx] = 0;
 
-      wcscat_s(renderdocPath, L"\\x64\\Development\\renderdoccmd.exe");
+      wcscat_s(renderdocPath, L"\\x64\\Development\\helpmecmd.exe");
     }
 
     if(!devLocation)
@@ -788,7 +1645,7 @@ rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
 
         renderdocPath[idx] = 0;
 
-        wcscat_s(renderdocPath, L"\\x64\\Release\\renderdoccmd.exe");
+        wcscat_s(renderdocPath, L"\\x64\\Release\\helpmecmd.exe");
       }
     }
 
@@ -808,7 +1665,7 @@ rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
         *slash = 0;
 
       // append path
-      wcscat_s(renderdocPath, L"\\renderdoccmd.exe");
+      wcscat_s(renderdocPath, L"\\helpmecmd.exe");
     }
 #endif
 
@@ -926,12 +1783,12 @@ rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
       RDResult result;
 #if RENDERDOC_OFFICIAL_BUILD
       SET_ERROR_RESULT(result, ResultCode::InternalError,
-                       "Can't run 32-bit renderdoccmd to capture 32-bit program.");
+                       "Can't run 32-bit helpmecmd to capture 32-bit program.");
 #else
       SET_ERROR_RESULT(
           result, ResultCode::InternalError,
-          "Can't run 32-bit renderdoccmd to capture 32-bit program."
-          "If this is a locally built RenderDoc you must build both 32-bit and 64-bit versions.");
+          "Can't run 32-bit helpmecmd to capture 32-bit program."
+          "If this is a locally built HelpMe you must build both 32-bit and 64-bit versions.");
 #endif
       CloseHandle(hProcess);
       return {result, 0};
@@ -963,18 +1820,33 @@ rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
       ResultCode code = (ResultCode)exitCode;
 
       RDResult result;
-      SET_ERROR_RESULT(result, code, "32-bit renderdoccmd returned '%s'", ToStr(code).c_str());
+      SET_ERROR_RESULT(result, code, "32-bit helpmecmd returned '%s'", ToStr(code).c_str());
       return {code, 0};
     }
 
     return {ResultCode::Succeeded, (uint32_t)exitCode};
   }
 
-  InjectDLL(hProcess, renderdocPath);
+  rdcstr injectionFailure;
+  if(!InjectDLLWithThreadContext(pid, hProcess, renderdocPath, &injectionFailure))
+  {
+    RDResult result;
+    SET_ERROR_RESULT(result, ResultCode::InjectionFailed,
+                     "Failed to inject %s.dll into process using SetThreadContext: %s",
+                     STRINGIZE(RDOC_BASE_NAME), injectionFailure.c_str());
+    CloseHandle(hProcess);
+    return {result, 0};
+  }
 
   const char *rdoc_dll = STRINGIZE(RDOC_BASE_NAME);
 
-  uintptr_t loc = FindRemoteDLL(pid, STRINGIZE(RDOC_BASE_NAME) ".dll");
+  uintptr_t loc = 0;
+  for(uint32_t retry = 0; retry < 20 && loc == 0; retry++)
+  {
+    loc = FindRemoteDLL(pid, STRINGIZE(RDOC_BASE_NAME) ".dll");
+    if(loc == 0)
+      Sleep(50);
+  }
 
   rdcpair<RDResult, uint32_t> result = {ResultCode::Succeeded, 0};
 
@@ -1148,7 +2020,7 @@ rdcpair<RDResult, uint32_t> Process::LaunchAndInjectIntoProcess(
     RDResult result;
     SET_ERROR_RESULT(
         result, ResultCode::InjectionFailed,
-        "For safety reasons RenderDoc does not support capturing executables with a "
+        "For safety reasons HelpMe does not support capturing executables with a "
         "reserved system filename such as '%s'. Please rename your executable to capture.",
         get_basename(app).c_str());
     return {result, 0};
@@ -1159,7 +2031,9 @@ rdcpair<RDResult, uint32_t> Process::LaunchAndInjectIntoProcess(
   if(pi.dwProcessId == 0)
   {
     RDResult result;
-    SET_ERROR_RESULT(result, ResultCode::InjectionFailed, "Failed to launch process.");
+    DWORD err = GetLastError();
+    SET_ERROR_RESULT(result, ResultCode::InjectionFailed,
+                     "Failed to launch process '%s' (Win32 error %lu).", app.c_str(), err);
     return {result, 0};
   }
 
@@ -1168,6 +2042,32 @@ rdcpair<RDResult, uint32_t> Process::LaunchAndInjectIntoProcess(
   CloseHandle(pi.hProcess);
   ResumeThread(pi.hThread);
   ResumeThread(pi.hThread);
+
+  // SetThreadContext can reach the target while its first loader initialisation is still in
+  // progress.  In that window LoadLibraryExW may enter our DLL and return ERROR_DLL_INIT_FAILED
+  // even though the same DLL loads normally once the process has reached user code.  The target
+  // has already been resumed above, so give it a short settling period and retry the injection
+  // against a normal running thread before reporting the failure to the caller.
+  if(ret.second == 0 && ret.first == ResultCode::InjectionFailed)
+  {
+    DWORD exitCode = STILL_ACTIVE;
+    HANDLE process = OpenProcess(PROCESS_QUERY_INFORMATION | SYNCHRONIZE, FALSE, pi.dwProcessId);
+    bool running = process != NULL &&
+                   (GetExitCodeProcess(process, &exitCode) != FALSE) &&
+                   exitCode == STILL_ACTIVE;
+    if(process)
+      CloseHandle(process);
+
+    if(running)
+    {
+      Sleep(500);
+      rdcpair<RDResult, uint32_t> retry =
+          InjectIntoProcess(pi.dwProcessId, {}, capturefile, opts, false);
+      // Keep the retry result even when it fails, since it describes the now-running target and
+      // is more useful than the initial loader-window error.
+      ret = retry;
+    }
+  }
 
   if(ret.second == 0 || ret.first != ResultCode::Succeeded)
   {
@@ -1221,7 +2121,7 @@ static RDResult HandleRegError(HKEY keyNative, HKEY keyWow32, LSTATUS ret, const
 
   RETURN_ERROR_RESULT(ResultCode::InjectionFailed,
                       "Error updating registry to enable global hook.\n"
-                      "Check that RenderDoc is correctly running as administrator.");
+                      "Check that HelpMe is correctly running as administrator.");
 }
 
 #define REG_CHECK(msg)                                    \
@@ -1247,8 +2147,8 @@ RDResult BackupAndChangeRegistry(GlobalHookData &hookdata, const rdcstr &shimpat
   {
     RETURN_ERROR_RESULT(
         ResultCode::FileIOFailed,
-        "RenderDoc is installed on a volume or system that has short paths disabled.\n"
-        "For the global hook, short paths must be enabled where RenderDoc is installed.");
+        "HelpMe is installed on a volume or system that has short paths disabled.\n"
+        "For the global hook, short paths must be enabled where HelpMe is installed.");
   }
 
   if(!shimpathWow32.empty())
@@ -1260,8 +2160,8 @@ RDResult BackupAndChangeRegistry(GlobalHookData &hookdata, const rdcstr &shimpat
     {
       RETURN_ERROR_RESULT(
           ResultCode::FileIOFailed,
-          "RenderDoc is installed on a volume or system that has short paths disabled.\n"
-          "For the global hook, short paths must be enabled where RenderDoc is installed.");
+          "HelpMe is installed on a volume or system that has short paths disabled.\n"
+          "For the global hook, short paths must be enabled where HelpMe is installed.");
     }
   }
 
@@ -1379,7 +2279,7 @@ RDResult BackupAndChangeRegistry(GlobalHookData &hookdata, const rdcstr &shimpat
   // write it to disk but don't fail if we can't, just print it to the log and keep going.
   wchar_t reg_backup[MAX_PATH];
   GetTempPathW(MAX_PATH, reg_backup);
-  wcscat_s(reg_backup, L"RenderDoc_RestoreGlobalHook.reg");
+  wcscat_s(reg_backup, L"HelpMe_RestoreGlobalHook.reg");
 
   FILE *f = NULL;
   _wfopen_s(&f, reg_backup, L"w");
@@ -1497,8 +2397,8 @@ RDResult Process::StartGlobalHook(const rdcstr &pathmatch, const rdcstr &capture
 
   renderdocPath = get_dirname(renderdocPath);
 
-  // the native renderdoccmd.exe is always next to the dll. Wow32 will be somewhere else
-  rdcstr cmdpathNative = renderdocPath + "\\renderdoccmd.exe";
+  // the native helpmecmd.exe is always next to the dll. Wow32 will be somewhere else
+  rdcstr cmdpathNative = renderdocPath + "\\helpmecmd.exe";
   rdcstr cmdpathWow32;
 
   rdcstr shimpathNative = renderdocPath;
@@ -1506,8 +2406,8 @@ RDResult Process::StartGlobalHook(const rdcstr &pathmatch, const rdcstr &capture
 
 #if ENABLED(RDOC_X64)
 
-  // native shim is just renderdocshim64.dll
-  shimpathNative = renderdocPath + "\\renderdocshim64.dll";
+  // native shim is just helpmesh64.dll
+  shimpathNative = renderdocPath + "\\helpmesh64.dll";
 
   // if it looks like we're in the development environment, look for the alternate bitness in the
   // corresponding folder
@@ -1516,8 +2416,8 @@ RDResult Process::StartGlobalHook(const rdcstr &pathmatch, const rdcstr &capture
   {
     renderdocPath.erase(devLocation, ~0U);
 
-    shimpathWow32 = renderdocPath + "\\Win32\\Development\\renderdocshim32.dll";
-    cmdpathWow32 = renderdocPath + "\\Win32\\Development\\renderdoccmd.exe";
+    shimpathWow32 = renderdocPath + "\\Win32\\Development\\helpmesh32.dll";
+    cmdpathWow32 = renderdocPath + "\\Win32\\Development\\helpmecmd.exe";
   }
   else
   {
@@ -1527,22 +2427,22 @@ RDResult Process::StartGlobalHook(const rdcstr &pathmatch, const rdcstr &capture
     {
       renderdocPath.erase(devLocation, ~0U);
 
-      shimpathWow32 = renderdocPath + "\\Win32\\Release\\renderdocshim32.dll";
-      cmdpathWow32 = renderdocPath + "\\Win32\\Release\\renderdoccmd.exe";
+      shimpathWow32 = renderdocPath + "\\Win32\\Release\\helpmesh32.dll";
+      cmdpathWow32 = renderdocPath + "\\Win32\\Release\\helpmecmd.exe";
     }
   }
 
   // if we're not in the dev environment, assume it's under a x86\ subfolder
   if(devLocation < 0)
   {
-    shimpathWow32 = renderdocPath + "\\x86\\renderdocshim32.dll";
-    cmdpathWow32 = renderdocPath + "\\x86\\renderdoccmd.exe";
+    shimpathWow32 = renderdocPath + "\\x86\\helpmesh32.dll";
+    cmdpathWow32 = renderdocPath + "\\x86\\helpmecmd.exe";
   }
 
 #else
 
   // nothing fancy to do here for 32-bit, just point the shim next to our dll.
-  shimpathNative = renderdocPath + "\\renderdocshim32.dll";
+  shimpathNative = renderdocPath + "\\helpmesh32.dll";
 
 #endif
 
@@ -1630,7 +2530,7 @@ RDResult Process::StartGlobalHook(const rdcstr &pathmatch, const rdcstr &capture
   {
     CloseHandle(hookdata.dataNative.pipe);
     RestoreRegistry(hookdata);
-    RETURN_ERROR_RESULT(ResultCode::InternalError, "Can't launch renderdoccmd from '%s' (err %u)",
+    RETURN_ERROR_RESULT(ResultCode::InternalError, "Can't launch helpmecmd from '%s' (err %u)",
                         cmdpathNative.c_str(), err);
   }
 
@@ -1691,7 +2591,7 @@ RDResult Process::StartGlobalHook(const rdcstr &pathmatch, const rdcstr &capture
     CloseHandle(hookdata.dataNative.pipe);
     CloseHandle(hookdata.dataWow32.pipe);
     RestoreRegistry(hookdata);
-    RETURN_ERROR_RESULT(ResultCode::InternalError, "Can't launch renderdoccmd from '%s' (err %u)",
+    RETURN_ERROR_RESULT(ResultCode::InternalError, "Can't launch helpmecmd from '%s' (err %u)",
                         cmdpathWow32.c_str(), err);
   }
 

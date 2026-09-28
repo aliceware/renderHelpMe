@@ -606,6 +606,7 @@ private:
 
   // the instance corresponding to this WrappedVulkan
   VkInstance m_Instance;
+  bool m_InternalInstance = false;
   // the instance's dbg msg callback handle
   VkDebugReportCallbackEXT m_DbgReportCallback;
   VkDebugUtilsMessengerEXT m_DbgUtilsCallback;

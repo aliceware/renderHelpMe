@@ -589,6 +589,10 @@ public:
   void RemoveFrameCapturer(DeviceOwnedWindow devWnd);
   bool HasActiveFrameCapturer(RDCDriver driver);
 
+  void AddVulkanBridgeCapturer(IFrameCapturer *cap);
+  void RemoveVulkanBridgeCapturer(IFrameCapturer *cap);
+  rdcarray<IFrameCapturer *> GetAllVulkanBridgeCapturers();
+
   // add window-less frame capturers for use via users capturing
   // manually through the renderdoc API with NULL device/window handles
   void AddDeviceFrameCapturer(void *dev, IFrameCapturer *cap);
@@ -754,6 +758,8 @@ private:
   std::map<DeviceOwnedWindow, FrameCap> m_WindowFrameCapturers;
   DeviceOwnedWindow m_ActiveWindow;
   std::map<void *, IFrameCapturer *> m_DeviceFrameCapturers;
+  rdcarray<IFrameCapturer *> m_VulkanBridgeCapturers;
+  uint32_t m_VulkanCapturesActive = 0;
 
   bool m_VendorExts[arraydim<VendorExtensions>()] = {};
 

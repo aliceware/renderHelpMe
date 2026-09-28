@@ -1121,7 +1121,25 @@ void RenderDoc::StartFrameCapture(DeviceOwnedWindow devWnd)
   IFrameCapturer *frameCap = MatchFrameCapturer(devWnd);
   if(frameCap)
   {
+    const bool isVulkan = frameCap->GetFrameCaptureDriver() == RDCDriver::Vulkan;
+
+    if(isVulkan)
+    {
+      SCOPED_LOCK(m_CapturerListLock);
+      m_VulkanCapturesActive++;
+    }
+
     frameCap->StartFrameCapture(devWnd);
+
+    if(isVulkan)
+    {
+      for(IFrameCapturer *cap : GetAllVulkanBridgeCapturers())
+      {
+        if(cap != frameCap)
+          cap->StartFrameCapture(DeviceOwnedWindow(NULL, NULL));
+      }
+    }
+
     m_CapturesActive++;
   }
 }
@@ -1151,7 +1169,26 @@ bool RenderDoc::EndFrameCapture(DeviceOwnedWindow devWnd)
   IFrameCapturer *frameCap = MatchFrameCapturer(devWnd);
   if(frameCap)
   {
+    const bool isVulkan = frameCap->GetFrameCaptureDriver() == RDCDriver::Vulkan;
+
+    if(isVulkan)
+    {
+      SCOPED_LOCK(m_CapturerListLock);
+      if(m_VulkanCapturesActive > 0)
+        m_VulkanCapturesActive--;
+    }
+
     bool ret = frameCap->EndFrameCapture(devWnd);
+
+    if(isVulkan)
+    {
+      for(IFrameCapturer *cap : GetAllVulkanBridgeCapturers())
+      {
+        if(cap != frameCap)
+          cap->EndFrameCapture(DeviceOwnedWindow(NULL, NULL));
+      }
+    }
+
     m_CapturesActive--;
     return ret;
   }
@@ -1163,7 +1200,26 @@ bool RenderDoc::DiscardFrameCapture(DeviceOwnedWindow devWnd)
   IFrameCapturer *frameCap = MatchFrameCapturer(devWnd);
   if(frameCap)
   {
+    const bool isVulkan = frameCap->GetFrameCaptureDriver() == RDCDriver::Vulkan;
+
+    if(isVulkan)
+    {
+      SCOPED_LOCK(m_CapturerListLock);
+      if(m_VulkanCapturesActive > 0)
+        m_VulkanCapturesActive--;
+    }
+
     bool ret = frameCap->DiscardFrameCapture(devWnd);
+
+    if(isVulkan)
+    {
+      for(IFrameCapturer *cap : GetAllVulkanBridgeCapturers())
+      {
+        if(cap != frameCap)
+          cap->DiscardFrameCapture(DeviceOwnedWindow(NULL, NULL));
+      }
+    }
+
     m_CapturesActive--;
     return ret;
   }
@@ -2328,6 +2384,53 @@ void RenderDoc::RemoveDeviceFrameCapturer(void *dev)
 
   SCOPED_LOCK(m_CapturerListLock);
   m_DeviceFrameCapturers.erase(dev);
+}
+
+void RenderDoc::AddVulkanBridgeCapturer(IFrameCapturer *cap)
+{
+  if(IsReplayApp())
+    return;
+
+  if(cap == NULL)
+  {
+    RDCERR("Invalid Vulkan bridge frame capturer: %#p", cap);
+    return;
+  }
+
+  bool startCapture = false;
+  {
+    SCOPED_LOCK(m_CapturerListLock);
+
+    if(!m_VulkanBridgeCapturers.contains(cap))
+    {
+      m_VulkanBridgeCapturers.push_back(cap);
+      startCapture = m_VulkanCapturesActive > 0;
+    }
+  }
+
+  if(startCapture)
+    cap->StartFrameCapture(DeviceOwnedWindow(NULL, NULL));
+}
+
+void RenderDoc::RemoveVulkanBridgeCapturer(IFrameCapturer *cap)
+{
+  if(IsReplayApp())
+    return;
+
+  if(cap == NULL)
+  {
+    RDCERR("Invalid Vulkan bridge frame capturer: %#p", cap);
+    return;
+  }
+
+  SCOPED_LOCK(m_CapturerListLock);
+  m_VulkanBridgeCapturers.removeOne(cap);
+}
+
+rdcarray<IFrameCapturer *> RenderDoc::GetAllVulkanBridgeCapturers()
+{
+  SCOPED_LOCK(m_CapturerListLock);
+  return m_VulkanBridgeCapturers;
 }
 
 void RenderDoc::AddFrameCapturer(DeviceOwnedWindow devWnd, IFrameCapturer *cap)
